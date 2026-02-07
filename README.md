@@ -1,6 +1,6 @@
-![](images/banner.png)
+![](images/github-header-banner-main.png)
 
-### 64-DOS is a **text-mode operating environment** inspired by MS-DOS, built on top of a modern 64-bit Linux kernel.
+**64-DOS** is a *text-mode operating environment* inspired by MS-DOS, built on top of a modern 64-bit Linux kernel.
 
 It boots directly into a custom C `/init` shell (no systemd, no Bash),
 providing a DOS-like user experience while retaining full modern
