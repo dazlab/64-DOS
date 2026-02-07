@@ -58,17 +58,30 @@ sudo chmod +x "$MNT/init"
 sync
 sudo umount "$MNT"
 
-echo "[3/4] Convert updated rootfs image to VDI..."
-rm -f "$NEW_VDI"
-VBoxManage convertfromraw "$ROOTFS_IMG" "$NEW_VDI" --format VDI >/dev/null
-
-echo "[4/4] (Optional) Swap VDI into VM storage..."
+echo "[3/5] Detach old rootfs disk (so it's not locked)..."
+CUR_UUID=""
 if VBoxManage showvminfo "$VM_NAME" >/dev/null 2>&1; then
   KEY="\"${STORAGE_CTL}\"-${ROOTFS_PORT}-${ROOTFS_DEVICE}"
-
   CUR_UUID="$(VBoxManage showvminfo "$VM_NAME" --machinereadable | \
     awk -F= -v key="$KEY" '$1==key {gsub(/"/,"",$2); print $2}' | head -n1)"
 
+  VBoxManage storageattach "$VM_NAME" \
+    --storagectl "$STORAGE_CTL" \
+    --port "$ROOTFS_PORT" \
+    --device "$ROOTFS_DEVICE" \
+    --type hdd \
+    --medium none >/dev/null
+fi
+
+echo "[4/5] Convert updated rootfs image to a new VDI..."
+STAMP="$(date +%Y%m%d-%H%M%S)"
+NEW_VDI="$IMAGES_DIR/dosmodern_${STAMP}.vdi"
+VBoxManage convertfromraw "$ROOTFS_IMG" "$NEW_VDI" --format VDI >/dev/null
+
+VBoxManage internalcommands sethduuid "$NEW_VDI" >/dev/null
+
+echo "[5/5] Attach new VDI and unregister the old one..."
+if VBoxManage showvminfo "$VM_NAME" >/dev/null 2>&1; then
   VBoxManage storageattach "$VM_NAME" \
     --storagectl "$STORAGE_CTL" \
     --port "$ROOTFS_PORT" \
@@ -79,11 +92,7 @@ if VBoxManage showvminfo "$VM_NAME" >/dev/null 2>&1; then
   if [[ -n "${CUR_UUID:-}" && "$CUR_UUID" != "none" ]]; then
     VBoxManage closemedium disk "$CUR_UUID" --delete >/dev/null 2>&1 || true
   fi
-
-  echo "Updated VM '$VM_NAME' to use: $NEW_VDI"
-else
-  echo "VM '$VM_NAME' not found. VDI created at: $NEW_VDI"
 fi
 
+echo "Using VDI: $NEW_VDI"
 echo "Done."
-
