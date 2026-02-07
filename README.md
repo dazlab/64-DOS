@@ -11,7 +11,7 @@ not a user experience.
 
 ---
 
-![](images/cmd.png)
+![](images/ice.png)
 
 ## What this is
 
