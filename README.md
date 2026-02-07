@@ -1,6 +1,6 @@
-# DOS-Modern
+# 64-DOS
 
-DOS-Modern is a **text-mode operating environment** inspired by MS-DOS,
+64-DOS is a **text-mode operating environment** inspired by MS-DOS,
 built on top of a modern 64-bit Linux kernel.
 
 It boots directly into a custom C `/init` shell (no systemd, no Bash),
@@ -25,7 +25,7 @@ not a user experience.
 ## What this is NOT
 
 - Not a Linux distribution
-- Not binary-compatible with real DOS
+- Not binary-compatible with real DOS (yet)
 - Not a shell theme or BusyBox wrapper
 
 ---
