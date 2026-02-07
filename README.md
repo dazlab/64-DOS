@@ -66,39 +66,228 @@ I plan to complete all builtin DOS commands and then begin working on the extern
 
 ---
 
-## Quick start (development)
+## Build and Run (Ubuntu + VirtualBox)
 
-This project assumes you already have:
-- a Buildroot environment
-- a VirtualBox VM wired to boot a rootfs image
+This project builds a minimal Linux system (via Buildroot) that boots directly into a custom C `/init` shell (PID 1).
+The workflow is: build on the host → run in VirtualBox.
 
-### 1. Edit the init shell
+### Host requirements
 
-```bash
-cd init
-nano init_shell.c
-```
+Hardware/firmware:
+- A 64-bit CPU
+- BIOS/UEFI virtualization enabled (Intel VT-x or AMD-V)
 
-### 2. Rebuild and Inject `/init`
+Host software (Ubuntu):
+- gcc toolchain
+- Buildroot build dependencies
+- VirtualBox + VBoxManage
+- Syslinux + FAT tools (for the BIOS boot disk)
+- mtools (used in some image workflows)
 
-```
-./build-init.sh
-```
+## Required packages (IMPORTANT)
 
-This will:
-- compile `/init`
-- inject it into the root filesystem image
-- regenerate the VirtualBox disk
-- upgrade the VM
+Install **all** of the following:
 
-### 3. Boot the VM
+    sudo apt update
+    sudo apt install -y \
+      git make gcc g++ bc bison flex libncurses-dev \
+      libelf-dev \
+      syslinux dosfstools \
+      xorriso mtools \
+      fdisk \
+      virtualbox
 
-You should land directly in:
+### Notes
 
-```
-64-DOS init shell
-C:\>
-```
+- `libelf-dev` is required to build the kernel (`gelf.h` errors otherwise)
+- Syslinux is used because VirtualBox EFI is unreliable
+- VirtualBox is required for the VM workflow
+
+---
+
+## VirtualBox 64-bit guests (CRITICAL)
+
+On Linux hosts, **KVM often steals VT-x / AMD-V**, preventing VirtualBox from running 64-bit guests.
+
+Typical error:
+
+> this kernel requires an x86_64 CPU, but only detected an i686 CPU
+
+### Fix (must be done every boot)
+
+    lsmod | grep -E 'kvm|vbox'
+    sudo modprobe -r kvm_intel kvm    # Intel
+    sudo modprobe -r kvm_amd kvm      # AMD
+
+Verify:
+
+    lsmod | grep kvm
+
+If KVM is loaded, **64-bit guests will not work**.
+
+---
+
+## Get Buildroot
+
+Buildroot is not installed via apt.
+
+    cd ~
+    git clone https://github.com/buildroot/buildroot.git
+    cd buildroot
+
+---
+
+## Configure Buildroot (x86_64)
+
+    cd ~/buildroot
+    make menuconfig
+
+Set:
+
+- Target Architecture → x86_64  
+- Init system → none  
+- Linux Kernel → enabled  
+- Kernel config → Default  
+- Filesystem images → ext2/3/4 (use ext2)
+
+---
+
+## Root filesystem overlay
+
+Create overlay directory:
+
+    mkdir -p ~/buildroot/overlay
+
+Re-enter menuconfig and set:
+
+- Root filesystem overlay directories:
+
+      /home/$USER/buildroot/overlay
+
+Your compiled init binary **must exist at**:
+
+    ~/buildroot/overlay/init
+
+---
+
+## Build
+
+    cd ~/buildroot
+    make -j$(nproc)
+
+Artifacts appear in:
+
+    ~/buildroot/output/images/
+
+You should see:
+
+- bzImage  
+- rootfs.ext2  
+
+---
+
+## Boot method (BIOS + Syslinux)
+
+VirtualBox EFI is unreliable.  
+This project intentionally uses **BIOS + Syslinux**.
+
+### Create BIOS boot disk (one-time)
+
+    dd if=/dev/zero of=~/bios.img bs=1M count=64
+    mkfs.vfat ~/bios.img
+    syslinux --install ~/bios.img
+
+    mkdir -p ~/bios_mount
+    sudo mount ~/bios.img ~/bios_mount
+    sudo cp ~/buildroot/output/images/bzImage ~/bios_mount/
+
+Create `syslinux.cfg` with these contents:
+
+    DEFAULT dosmodern
+    LABEL dosmodern
+        LINUX bzImage
+        APPEND root=/dev/sdb rw init=/init console=tty0 loglevel=7
+
+Then:
+
+    sync
+    sudo umount ~/bios_mount
+    VBoxManage convertfromraw ~/bios.img ~/bios.vdi --format VDI
+
+---
+
+## Convert root filesystem to VDI
+
+    cd ~/buildroot/output/images
+    VBoxManage convertfromraw rootfs.ext2 dosmodern.vdi --format VDI
+
+---
+
+## Create the VM (one-time)
+
+System:
+- Disable EFI
+- Boot order: Hard Disk first
+
+Storage (SATA / AHCI):
+- Port 0 → bios.vdi  
+- Port 1 → dosmodern.vdi  
+
+Display:
+- VBoxVGA
+
+Boot the VM. You should see:
+
+    DazLab 64-DOS 0.1
+    Distributed under a MIT License
+    Type `help` or `exit`
+    C:\>
+
+---
+
+## Development workflow
+
+Edit → rebuild → boot.
+
+Create a local config (not committed):
+
+    init/local.env
+
+Example:
+
+    BR_DIR="$HOME/buildroot"
+    VM_NAME="64-DOS"
+    STORAGE_CTL="AHCI"
+    ROOTFS_PORT="1"
+
+Rebuild:
+
+    cd init
+    ./build.sh
+
+---
+
+## Known issues
+
+- libelf-dev is required  
+- KVM must be unloaded  
+- VirtualBox EFI is avoided intentionally  
+- VDI UUID collisions are handled by the build script  
+
+---
+
+## Contributing
+
+This project values:
+
+- explicit control  
+- minimalism  
+- text-first design  
+- no hidden services  
+
+Pull requests should preserve these principles.
+
+---
 
 ## Architecture
 
