@@ -1,4 +1,4 @@
-![](images/header-logo.png)
+![](images/banner.png)
 
 ### 64-DOS is a **text-mode operating environment** inspired by MS-DOS,
 built on top of a modern 64-bit Linux kernel.
