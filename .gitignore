@@ -1,0 +1,61 @@
+# ------------------------------
+# Local environment overrides
+# ------------------------------
+init/local.env
+
+# ------------------------------
+# Build artifacts (never commit)
+# ------------------------------
+*.img
+*.iso
+*.vdi
+*.vmdk
+*.qcow2
+
+# Buildroot output
+buildroot/output/
+buildroot/.config
+buildroot/dl/
+buildroot/.stamp_*
+
+# Kernel artifacts
+bzImage
+vmlinuz*
+System.map*
+*.o
+*.a
+*.so
+
+# Root filesystem images
+rootfs.*
+*.ext2
+*.ext3
+*.ext4
+*.squashfs
+*.tar
+
+# Temporary mount points
+mnt/
+tmp/
+*.mount
+
+# ------------------------------
+# Tooling / OS noise
+# ------------------------------
+*.log
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ------------------------------
+# IDE / editor files
+# ------------------------------
+.vscode/
+.idea/
+
+# ------------------------------
+# Local Settings Overrides
+# ------------------------------
+init/local.env
