@@ -51,3 +51,30 @@ This project assumes you already have:
 ```bash
 cd init
 nano init_shell.c
+```
+
+### 2. Rebuild and Inject `/init`
+
+```
+./build-init.sh
+```
+
+This will:
+- compile `/init`
+- inject it into the root filesystem image
+- regenerate the VirtualBox disk
+- upgrade the VM
+
+### 3. Boot the VM
+
+You should land directly in:
+
+```
+64-DOS init shell
+C:\>
+```
+
+## Architecture
+
+See [docs/architecture.md](docs/architecture.md) for design goals, boot flow
+and rationale.

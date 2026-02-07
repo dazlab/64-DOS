@@ -11,6 +11,7 @@ init/local.env
 *.vdi
 *.vmdk
 *.qcow2
+init/.build/
 
 # Buildroot output
 buildroot/output/
