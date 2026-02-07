@@ -1,7 +1,6 @@
 ![](images/header-logo.png)
-# 64-DOS
 
-64-DOS is a **text-mode operating environment** inspired by MS-DOS,
+### 64-DOS is a **text-mode operating environment** inspired by MS-DOS,
 built on top of a modern 64-bit Linux kernel.
 
 It boots directly into a custom C `/init` shell (no systemd, no Bash),
@@ -30,6 +29,31 @@ not a user experience.
 - Not a shell theme or BusyBox wrapper
 
 ---
+
+## The Goal of the Project
+I wondered what it would be like if DOS had continued to be developed, evolving with changing hardware whilst retaining
+it's infamous CLI aesthetics, offering a modern alternative to the GUI paradigm. FreeDOS tries to do this, at least
+to some small extent, but it's hardware support can be sketchy, and it isn't 64-bit. It's mainly concerned with providing
+en environment in which to run DOS programs.
+
+Given the inherent incompatibilities in implementing a true Real-Mode DOS on modern CPUs, and wanting to avoid the huge effort
+in building a modern DOS from the ground up (as much as I would love such a project to exist), the simplest solution I could think 
+of was to utilise the Linux kernel and build on top of it a custom DOS-like command shell.
+
+### Current Features
+The system currently boots into the command shell and provides a suite of DOS builtins, written in C:
+- DIR
+- CLS
+- REN
+- TYPE
+- COPY
+- MD/RD
+- DEL
+
+ALl currently-implemented commands support the `/?` help switch, as well as wildcards.
+
+### Planned Upgrades
+I plan to complete all builtin DOS commands and then begin working on the external ones, such as `FDISK`, `FORMAT`, `EDIT` etc.
 
 ## Requirements (host)
 
