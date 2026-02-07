@@ -7,20 +7,23 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
-#include <termios.h>
 
 #define DOS_C_ROOT "/dos/c"
 
 static volatile sig_atomic_t g_got_sigchld = 0;
+static int g_echo_on = 1;
+
+static int g_fg = 7; // DOS-ish default: light gray
+static int g_bg = 0; // DOS-ish default: black
 
 static void on_sigchld(int sig) {
     (void)sig;
@@ -37,8 +40,6 @@ static void reap_children_nonblock(void) {
     g_got_sigchld = 0;
 }
 
-
-
 static void ensure_stdio(void) {
     int fd = open("/dev/console", O_RDWR);
     if (fd < 0) return;
@@ -46,12 +47,6 @@ static void ensure_stdio(void) {
     dup2(fd, 1);
     dup2(fd, 2);
     if (fd > 2) close(fd);
-}
-
-static int is_dir_path(const char *linuxp) {
-    struct stat st;
-    if (stat(linuxp, &st) != 0) return 0;
-    return S_ISDIR(st.st_mode);
 }
 
 static void mount_basic_fs(void) {
@@ -155,12 +150,65 @@ static void split_dir_pat(const char *linuxspec,
     else snprintf(out_pat, patsz, "%s", p);
 }
 
+static int is_dir_path(const char *linuxp) {
+    struct stat st;
+    if (stat(linuxp, &st) != 0) return 0;
+    return S_ISDIR(st.st_mode);
+}
+
 static const char *dos_basename(const char *p) {
     const char *last = p;
     for (; *p; p++) {
         if (*p == '\\' || *p == '/') last = p + 1;
     }
     return last;
+}
+
+/* DIR switch parsing + filespec extraction */
+static void parse_dir_switches(const char *arg, int *wide, int *all) {
+    *wide = 0;
+    *all  = 0;
+    if (!arg) return;
+
+    const char *p = arg;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        const char *t = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+
+        size_t n = (size_t)(p - t);
+        if (n >= 2 && t[0] == '/') {
+            char sw = t[1];
+            if (sw == 'w' || sw == 'W') *wide = 1;
+            if (sw == 'a' || sw == 'A') *all  = 1;
+        }
+    }
+}
+
+static const char *dir_find_filespec(const char *arg, char *out, size_t outsz) {
+    if (!arg) return NULL;
+
+    const char *p = arg;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+
+        const char *t = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+
+        size_t n = (size_t)(p - t);
+        if (n == 0) continue;
+
+        if (t[0] == '/') continue; // skip switches
+
+        if (n >= outsz) n = outsz - 1;
+        memcpy(out, t, n);
+        out[n] = 0;
+        return out;
+    }
+    return NULL;
 }
 
 /* --- DOS path mapping (single drive C:) --- */
@@ -241,91 +289,310 @@ static int dos_to_linux_path(const char *dos, char *out, size_t outlen) {
     }
 }
 
+/* --- COLOR persistence --- */
+
+static int hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    c = tolower((unsigned char)c);
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    return -1;
+}
+
+static void apply_color(void) {
+    int fg_code = (g_fg < 8) ? (30 + g_fg) : (90 + (g_fg - 8));
+    int bg_code = (g_bg < 8) ? (40 + g_bg) : (100 + (g_bg - 8));
+
+    char seq[32];
+    int n = snprintf(seq, sizeof seq, "\033[%d;%dm", bg_code, fg_code);
+    if (n > 0) (void)write(1, seq, (size_t)n);
+}
+
+static void save_config(void) {
+    // We're already chdir'd into DOS_C_ROOT, so write relative
+    int fd = open("DOS.CFG", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+
+    char buf[64];
+    int n = snprintf(buf, sizeof buf, "COLOR=%X%X\n", g_bg, g_fg);
+    if (n > 0) (void)write(fd, buf, (size_t)n);
+    close(fd);
+}
+
+static void load_config(void) {
+    // Try both cases (in case the file was created/edited manually)
+    int fd = open("DOS.CFG", O_RDONLY);
+    if (fd < 0) fd = open("dos.cfg", O_RDONLY);
+    if (fd < 0) return;
+
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+
+    // Find a line that starts with COLOR= (case-insensitive)
+    for (char *p = buf; *p; ) {
+        // skip leading whitespace
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+
+        if (!strncasecmp(p, "COLOR=", 6)) {
+            p += 6;
+            int a = hexval((unsigned char)p[0]);
+            int b = hexval((unsigned char)p[1]);
+            if (a >= 0 && b >= 0 && a != b) {
+                g_bg = a;
+                g_fg = b;
+            }
+            return;
+        }
+
+        // next line
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+}
+
+/* --- prompt --- */
+
 static void print_prompt(void) {
     char dos[PATH_MAX + 8];
     linux_to_dos_cwd(dos, sizeof dos);
 
     if (!strcmp(dos, "C:\\")) {
-        write(1, "C:\\> ", 5);
+        (void)write(1, "C:\\> ", 5);
         return;
     }
 
     size_t n = strnlen(dos, sizeof dos);
-    write(1, dos, n);
-    write(1, "> ", 2);
+    (void)write(1, dos, n);
+    (void)write(1, "> ", 2);
 }
 
 /* --- builtins --- */
 
 static void builtin_cls(void) {
     const char *seq = "\033[2J\033[H";
-    write(1, seq, 7);
+    (void)write(1, seq, 7);
 }
 
-static void builtin_type(const char *arg) {
+static void builtin_pause(void) {
+    const char *msg = "Press any key to continue . . .";
+    (void)write(1, msg, strlen(msg));
+
+    struct termios oldt, raw;
+    int has_tty = (tcgetattr(0, &oldt) == 0);
+    if (has_tty) {
+        raw = oldt;
+        raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+        (void)tcsetattr(0, TCSANOW, &raw);
+    }
+
+    unsigned char c;
+    (void)read(0, &c, 1);
+
+    if (has_tty) (void)tcsetattr(0, TCSANOW, &oldt);
+
+    (void)write(1, "\r\n", 2);
+}
+
+static void builtin_exit(void) {
+    do_poweroff();
+}
+
+static void builtin_echo(const char *arg) {
     if (is_help_switch(arg)) {
         const char *msg =
-            "TYPE file\n"
-            "  Displays the contents of a text file.\n";
-        write(1, msg, strlen(msg));
+            "ECHO [ON|OFF|message]\n"
+            "  Displays messages, or turns command echoing on or off.\n";
+        (void)write(1, msg, strlen(msg));
         return;
     }
 
     if (!arg || !*arg) {
-        write(1, "File not found\n", 15);
+        if (g_echo_on) (void)write(1, "ECHO is on.\n", 12);
+        else           (void)write(1, "ECHO is off.\n", 13);
         return;
     }
 
+    while (*arg == ' ' || *arg == '\t') arg++;
+    if (!*arg) {
+        if (g_echo_on) (void)write(1, "ECHO is on.\n", 12);
+        else           (void)write(1, "ECHO is off.\n", 13);
+        return;
+    }
+
+    if (!strncasecmp(arg, "on", 2) && (arg[2] == 0 || arg[2] == ' ' || arg[2] == '\t')) {
+        g_echo_on = 1;
+        return;
+    }
+    if (!strncasecmp(arg, "off", 3) && (arg[3] == 0 || arg[3] == ' ' || arg[3] == '\t')) {
+        g_echo_on = 0;
+        return;
+    }
+
+    (void)write(1, arg, strlen(arg));
+    (void)write(1, "\n", 1);
+}
+
+static void builtin_color(const char *arg) {
+    if (is_help_switch(arg)) {
+        const char *msg =
+            "COLOR [attr]\n"
+            "  attr: two hex digits. First = background, second = foreground.\n"
+            "  Example: COLOR 1F\n";
+        (void)write(1, msg, strlen(msg));
+        return;
+    }
+
+    if (!arg || !*arg) {
+        char msg[64];
+        snprintf(msg, sizeof msg, "Current color: %X%X\n", g_bg, g_fg);
+        (void)write(1, msg, strlen(msg));
+        return;
+    }
+
+    while (*arg == ' ' || *arg == '\t') arg++;
+
+    int a = hexval((unsigned char)arg[0]);
+    int b = hexval((unsigned char)arg[1]);
+    if (a < 0 || b < 0) { (void)write(1, "Invalid parameter\n", 18); return; }
+
+    const char *p = arg + 2;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != 0) { (void)write(1, "Invalid parameter\n", 18); return; }
+
+    if (a == b) { (void)write(1, "Invalid parameter\n", 18); return; }
+
+    g_bg = a;
+    g_fg = b;
+    apply_color();
+    save_config();
+}
+
+static void builtin_type(const char *arg) {
+    if (is_help_switch(arg)) {
+        const char *msg = "TYPE file\n  Displays the contents of a text file.\n";
+        (void)write(1, msg, strlen(msg));
+        return;
+    }
+
+    if (!arg || !*arg) { (void)write(1, "File not found\n", 15); return; }
+
     char linuxp[PATH_MAX];
     if (dos_to_linux_path(arg, linuxp, sizeof linuxp) != 0) {
-        write(1, "File not found\n", 15);
+        (void)write(1, "File not found\n", 15);
         return;
     }
 
     int fd = open(linuxp, O_RDONLY);
-    if (fd < 0) {
-        write(1, "File not found\n", 15);
-        return;
-    }
+    if (fd < 0) { (void)write(1, "File not found\n", 15); return; }
 
     char buf[512];
     ssize_t n;
     while ((n = read(fd, buf, sizeof buf)) > 0) {
-        write(1, buf, (size_t)n);
+        (void)write(1, buf, (size_t)n);
     }
     close(fd);
+}
+
+static void builtin_copy_con(const char *dst_dos) {
+    if (!dst_dos || !*dst_dos) {
+        (void)write(1, "Invalid number of parameters\n", 29);
+        return;
+    }
+
+    char dst_linux[PATH_MAX];
+    if (dos_to_linux_path(dst_dos, dst_linux, sizeof dst_linux) != 0) {
+        (void)write(1, "Invalid drive\n", 14);
+        return;
+    }
+
+    int fd = open(dst_linux, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { (void)write(1, "Access denied\n", 14); return; }
+
+    (void)write(1, "Enter text. End with Ctrl+Z.\r\n", 31);
+
+    struct termios oldt, raw;
+    int has_tty = (tcgetattr(0, &oldt) == 0);
+    if (has_tty) {
+        raw = oldt;
+        raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+        raw.c_iflag &= ~(ICRNL);
+        raw.c_oflag &= ~(ONLCR);
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+        (void)tcsetattr(0, TCSANOW, &raw);
+    }
+
+    char linebuf[512];
+    size_t len = 0;
+
+    for (;;) {
+        unsigned char c;
+        ssize_t n = read(0, &c, 1);
+        if (n <= 0) break;
+
+        if (c == 0x1A) { // Ctrl+Z
+            (void)write(1, "^Z\r\n", 4);
+            if (len) (void)write(fd, linebuf, len);
+            break;
+        }
+
+        if (c == '\r' || c == '\n') {
+            (void)write(1, "\r\n", 2);
+            if (len) (void)write(fd, linebuf, len);
+            (void)write(fd, "\r\n", 2);
+            len = 0;
+            continue;
+        }
+
+        if (c == 0x08 || c == 0x7F) {
+            if (len > 0) {
+                len--;
+                (void)write(1, "\b \b", 3);
+            }
+            continue;
+        }
+
+        if (c < 0x20 && c != '\t') continue;
+
+        if (len + 1 < sizeof linebuf) {
+            linebuf[len++] = (char)c;
+            (void)write(1, &c, 1);
+        }
+    }
+
+    if (has_tty) (void)tcsetattr(0, TCSANOW, &oldt);
+
+    close(fd);
+    (void)write(1, "        1 file(s) copied.\r\n", 28);
 }
 
 static void builtin_del(const char *arg) {
     if (is_help_switch(arg)) {
         const char *msg =
-            "DEL [filespec]\n"
-            "ERASE [filespec]\n"
-            "  Deletes file(s).\n"
-            "  Wildcards: * and ?\n"
-            "Examples:\n"
-            "  DEL TEMP.TXT\n"
-            "  DEL *.OBJ\n";
-        write(1, msg, strlen(msg));
+            "DEL [filespec]\nERASE [filespec]\n"
+            "  Deletes file(s). Wildcards: * and ?\n";
+        (void)write(1, msg, strlen(msg));
         return;
     }
 
-    if (!arg || !*arg) {
-        write(1, "File not found\n", 15);
-        return;
-    }
+    if (!arg || !*arg) { (void)write(1, "File not found\n", 15); return; }
 
     char linuxspec[PATH_MAX];
     if (dos_to_linux_path(arg, linuxspec, sizeof linuxspec) != 0) {
-        write(1, "File not found\n", 15);
+        (void)write(1, "File not found\n", 15);
         return;
     }
 
     if (!has_wildcards(linuxspec)) {
         struct stat st;
-        if (stat(linuxspec, &st) != 0) { write(1, "File not found\n", 15); return; }
-        if (S_ISDIR(st.st_mode)) { write(1, "Access denied\n", 14); return; }
-        if (unlink(linuxspec) != 0) { write(1, "Access denied\n", 14); return; }
+        if (stat(linuxspec, &st) != 0) { (void)write(1, "File not found\n", 15); return; }
+        if (S_ISDIR(st.st_mode)) { (void)write(1, "Access denied\n", 14); return; }
+        if (unlink(linuxspec) != 0) { (void)write(1, "Access denied\n", 14); return; }
         return;
     }
 
@@ -334,7 +601,7 @@ static void builtin_del(const char *arg) {
     split_dir_pat(linuxspec, dirpath, sizeof dirpath, pattern, sizeof pattern);
 
     DIR *d = opendir(dirpath);
-    if (!d) { write(1, "File not found\n", 15); return; }
+    if (!d) { (void)write(1, "File not found\n", 15); return; }
 
     long long deleted = 0;
 
@@ -355,40 +622,34 @@ static void builtin_del(const char *arg) {
 
     closedir(d);
 
-    if (deleted == 0) {
-        write(1, "File not found\n", 15);
-    }
+    if (deleted == 0) (void)write(1, "File not found\n", 15);
 }
 
 static void builtin_cd(const char *arg) {
     if (is_help_switch(arg)) {
         const char *msg =
-            "CD [path]\n"
-            "  Changes the current directory.\n"
-            "Examples:\n"
-            "  CD \\\n"
-            "  CD \\BIN\n";
-        write(1, msg, strlen(msg));
+            "CD [path]\n  Changes the current directory.\n";
+        (void)write(1, msg, strlen(msg));
         return;
     }
 
     if (!arg || !*arg) {
         char dos[PATH_MAX + 8];
         linux_to_dos_cwd(dos, sizeof dos);
-        write(1, dos, strnlen(dos, sizeof dos));
-        write(1, "\n", 1);
+        (void)write(1, dos, strnlen(dos, sizeof dos));
+        (void)write(1, "\n", 1);
         return;
     }
 
     char linuxp[PATH_MAX];
     if (dos_to_linux_path(arg, linuxp, sizeof linuxp) != 0) {
-        write(1, "Invalid drive\n", 14);
+        (void)write(1, "Invalid drive\n", 14);
         return;
     }
 
     if (chdir(linuxp) == 0) return;
 
-    write(1, "The system cannot find the path specified.\n", 43);
+    (void)write(1, "The system cannot find the path specified.\n", 43);
 }
 
 static void dos_print_dir_line(const char *name, const struct stat *st) {
@@ -417,29 +678,32 @@ static void dos_print_dir_line(const char *name, const struct stat *st) {
                  name);
     }
 
-    write(1, buf, strnlen(buf, sizeof buf));
+    (void)write(1, buf, strnlen(buf, sizeof buf));
 }
 
 static void builtin_dir(const char *arg) {
     if (is_help_switch(arg)) {
         const char *msg =
-            "DIR [filespec]\n"
-            "  Lists files.\n"
-            "  Wildcards: * and ?\n"
-            "Examples:\n"
-            "  DIR\n"
-            "  DIR *.TXT\n"
-            "  DIR \\BIN\\*.EXE\n";
-        write(1, msg, strlen(msg));
+            "DIR [filespec] [/W] [/A]\n"
+            "  /W  Wide listing\n"
+            "  /A  Show all (includes . and ..)\n"
+            "  Wildcards: * and ?\n";
+        (void)write(1, msg, strlen(msg));
         return;
     }
+
+    int wide = 0, all = 0;
+    parse_dir_switches(arg, &wide, &all);
+
+    char filespec_tok[PATH_MAX];
+    const char *filespec = dir_find_filespec(arg, filespec_tok, sizeof filespec_tok);
 
     char linuxspec[PATH_MAX];
     const char *spec_linux = NULL;
 
-    if (arg && *arg) {
-        if (dos_to_linux_path(arg, linuxspec, sizeof linuxspec) != 0) {
-            write(1, "Invalid drive\n", 14);
+    if (filespec && *filespec) {
+        if (dos_to_linux_path(filespec, linuxspec, sizeof linuxspec) != 0) {
+            (void)write(1, "Invalid drive\n", 14);
             return;
         }
         spec_linux = linuxspec;
@@ -451,35 +715,43 @@ static void builtin_dir(const char *arg) {
     if (!spec_linux) {
         snprintf(dirpath, sizeof dirpath, ".");
         snprintf(pattern, sizeof pattern, "*");
-    } else if (has_wildcards(spec_linux)) {
-        split_dir_pat(spec_linux, dirpath, sizeof dirpath, pattern, sizeof pattern);
     } else {
-        split_dir_pat(spec_linux, dirpath, sizeof dirpath, pattern, sizeof pattern);
+        if (has_wildcards(spec_linux)) {
+            split_dir_pat(spec_linux, dirpath, sizeof dirpath, pattern, sizeof pattern);
+        } else if (is_dir_path(spec_linux)) {
+            snprintf(dirpath, sizeof dirpath, "%s", spec_linux);
+            snprintf(pattern, sizeof pattern, "*");
+        } else {
+            // e.g. DIR FOO.TXT or DIR \BIN\KERNEL.SYS
+            split_dir_pat(spec_linux, dirpath, sizeof dirpath, pattern, sizeof pattern);
+        }
     }
 
     DIR *d = opendir(dirpath);
     if (!d) {
-        write(1, "File not found\n", 15);
+        (void)write(1, "File not found\n", 15);
         return;
     }
 
+    // Header path
     char doshdr[PATH_MAX + 8];
-    if (!arg || !*arg) {
+    if (!filespec) {
         linux_to_dos_cwd(doshdr, sizeof doshdr);
     } else {
-        const char *p = arg;
-        while (*p == ' ' || *p == '\t') p++;
-        if ((p[0] == '\\') || (p[0] == '/')) snprintf(doshdr, sizeof doshdr, "C:%s", p);
-        else if (isalpha((unsigned char)p[0]) && p[1] == ':') snprintf(doshdr, sizeof doshdr, "%s", p);
-        else linux_to_dos_cwd(doshdr, sizeof doshdr);
-
+        // If they passed a directory, show that dir. If they passed a filespec, show the spec token.
+        if (filespec[0] == '\\' || filespec[0] == '/') snprintf(doshdr, sizeof doshdr, "C:%s", filespec);
+        else if (isalpha((unsigned char)filespec[0]) && filespec[1] == ':') snprintf(doshdr, sizeof doshdr, "%s", filespec);
+        else {
+            // relative token: show current dir (DOS does)
+            linux_to_dos_cwd(doshdr, sizeof doshdr);
+        }
         for (size_t i = 0; doshdr[i]; i++) if (doshdr[i] == '/') doshdr[i] = '\\';
     }
 
     {
-        char hdr[PATH_MAX + 64];
+        char hdr[PATH_MAX + 96];
         snprintf(hdr, sizeof hdr, "\n Directory of %s\n\n", doshdr);
-        write(1, hdr, strnlen(hdr, sizeof hdr));
+        (void)write(1, hdr, strnlen(hdr, sizeof hdr));
     }
 
     long long total_bytes = 0;
@@ -487,11 +759,19 @@ static void builtin_dir(const char *arg) {
     long long dir_count = 0;
     long long shown = 0;
 
+    int col = 0;
+
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         const char *name = de->d_name;
 
-        if (!wildmatch_ci(pattern, name)) continue;
+        if (!all) {
+            if (!strcmp(name, ".") || !strcmp(name, ".."))
+                continue;
+        }
+
+        if (!wildmatch_ci(pattern, name))
+            continue;
 
         char full[PATH_MAX * 2];
         snprintf(full, sizeof full, "%s/%s", dirpath, name);
@@ -499,7 +779,19 @@ static void builtin_dir(const char *arg) {
         struct stat st;
         if (lstat(full, &st) != 0) continue;
 
-        dos_print_dir_line(name, &st);
+        if (wide) {
+            char out[32];
+            snprintf(out, sizeof out, "%-15s", name);
+            (void)write(1, out, strlen(out));
+            col++;
+            if (col == 5) {
+                (void)write(1, "\n", 1);
+                col = 0;
+            }
+        } else {
+            dos_print_dir_line(name, &st);
+        }
+
         shown++;
 
         if (S_ISDIR(st.st_mode)) dir_count++;
@@ -508,8 +800,10 @@ static void builtin_dir(const char *arg) {
 
     closedir(d);
 
+    if (wide && col != 0) (void)write(1, "\n", 1);
+
     if (shown == 0) {
-        write(1, "File not found\n", 15);
+        (void)write(1, "File not found\n", 15);
         return;
     }
 
@@ -518,24 +812,18 @@ static void builtin_dir(const char *arg) {
         snprintf(tail, sizeof tail,
                  "\n%8lld File(s) %14lld bytes\n%8lld Dir(s)\n\n",
                  file_count, total_bytes, dir_count);
-        write(1, tail, strnlen(tail, sizeof tail));
+        (void)write(1, tail, strnlen(tail, sizeof tail));
     }
 }
 
 static void builtin_ren(const char *arg) {
     if (is_help_switch(arg)) {
-        const char *msg =
-            "REN src dest\n"
-            "RENAME src dest\n"
-            "  Renames a file.\n";
-        write(1, msg, strlen(msg));
+        const char *msg = "REN src dest\nRENAME src dest\n  Renames a file.\n";
+        (void)write(1, msg, strlen(msg));
         return;
     }
 
-    if (!arg || !*arg) {
-        write(1, "File not found\n", 15);
-        return;
-    }
+    if (!arg || !*arg) { (void)write(1, "File not found\n", 15); return; }
 
     char tmp[1024];
     strncpy(tmp, arg, sizeof tmp - 1);
@@ -543,7 +831,7 @@ static void builtin_ren(const char *arg) {
 
     char *p = tmp;
     while (*p == ' ' || *p == '\t') p++;
-    if (!*p) { write(1, "File not found\n", 15); return; }
+    if (!*p) { (void)write(1, "File not found\n", 15); return; }
 
     char *src = p;
     while (*p && *p != ' ' && *p != '\t') p++;
@@ -551,112 +839,83 @@ static void builtin_ren(const char *arg) {
 
     while (*p == ' ' || *p == '\t') p++;
     char *dst = *p ? p : NULL;
-
-    if (!dst || !*dst) {
-        write(1, "File not found\n", 15);
-        return;
-    }
+    if (!dst || !*dst) { (void)write(1, "File not found\n", 15); return; }
 
     char src_linux[PATH_MAX];
     char dst_linux[PATH_MAX];
 
     if (dos_to_linux_path(src, src_linux, sizeof src_linux) != 0) {
-        write(1, "File not found\n", 15);
+        (void)write(1, "File not found\n", 15);
         return;
     }
 
     if (strchr(dst, '\\') || strchr(dst, '/') || (isalpha((unsigned char)dst[0]) && dst[1] == ':')) {
         if (dos_to_linux_path(dst, dst_linux, sizeof dst_linux) != 0) {
-            write(1, "File not found\n", 15);
+            (void)write(1, "File not found\n", 15);
             return;
         }
     } else {
         char cwd[PATH_MAX];
-        if (!getcwd(cwd, sizeof cwd)) { write(1, "Access denied\n", 14); return; }
+        if (!getcwd(cwd, sizeof cwd)) { (void)write(1, "Access denied\n", 14); return; }
         snprintf(dst_linux, sizeof dst_linux, "%s/%s", cwd, dst);
     }
 
     struct stat st;
-    if (stat(src_linux, &st) != 0) {
-        write(1, "File not found\n", 15);
-        return;
-    }
-    if (S_ISDIR(st.st_mode)) {
-        write(1, "Access denied\n", 14);
-        return;
-    }
+    if (stat(src_linux, &st) != 0) { (void)write(1, "File not found\n", 15); return; }
+    if (S_ISDIR(st.st_mode)) { (void)write(1, "Access denied\n", 14); return; }
 
     if (rename(src_linux, dst_linux) != 0) {
-        write(1, "Access denied\n", 14);
+        (void)write(1, "Access denied\n", 14);
         return;
     }
 }
 
 static void builtin_md(const char *arg) {
     if (is_help_switch(arg)) {
-        const char *msg =
-            "MD dir\n"
-            "MKDIR dir\n"
-            "  Creates a directory.\n";
-        write(1, msg, strlen(msg));
+        const char *msg = "MD dir\nMKDIR dir\n  Creates a directory.\n";
+        (void)write(1, msg, strlen(msg));
         return;
     }
 
-    if (!arg || !*arg) {
-        write(1, "Invalid directory\n", 18);
-        return;
-    }
+    if (!arg || !*arg) { (void)write(1, "Invalid directory\n", 18); return; }
 
     char linuxp[PATH_MAX];
     if (dos_to_linux_path(arg, linuxp, sizeof linuxp) != 0) {
-        write(1, "Invalid drive\n", 14);
+        (void)write(1, "Invalid drive\n", 14);
         return;
     }
 
     if (mkdir(linuxp, 0755) == 0) return;
 
-    if (errno == EEXIST) {
-        write(1, "A subdirectory or file already exists.\n", 39);
-    } else {
-        write(1, "Access denied\n", 14);
-    }
+    if (errno == EEXIST) (void)write(1, "A subdirectory or file already exists.\n", 39);
+    else                 (void)write(1, "Access denied\n", 14);
 }
 
 static void builtin_rd(const char *arg) {
     if (is_help_switch(arg)) {
-        const char *msg =
-            "RD dir\n"
-            "RMDIR dir\n"
-            "  Removes an empty directory.\n";
-        write(1, msg, strlen(msg));
+        const char *msg = "RD dir\nRMDIR dir\n  Removes an empty directory.\n";
+        (void)write(1, msg, strlen(msg));
         return;
     }
 
-    if (!arg || !*arg) {
-        write(1, "Invalid directory\n", 18);
-        return;
-    }
+    if (!arg || !*arg) { (void)write(1, "Invalid directory\n", 18); return; }
 
     char linuxp[PATH_MAX];
     if (dos_to_linux_path(arg, linuxp, sizeof linuxp) != 0) {
-        write(1, "Invalid drive\n", 14);
+        (void)write(1, "Invalid drive\n", 14);
         return;
     }
 
     if (!strcmp(linuxp, DOS_C_ROOT) || !strcmp(linuxp, DOS_C_ROOT "/")) {
-        write(1, "Access denied\n", 14);
+        (void)write(1, "Access denied\n", 14);
         return;
     }
 
     if (rmdir(linuxp) == 0) return;
 
-    if (errno == ENOTEMPTY || errno == EEXIST) {
-        write(1, "The directory is not empty.\n", 28);
-    } else if (errno == ENOENT) {
-        write(1, "The system cannot find the file specified.\n", 44);
-    } else {
-        write(1, "Access denied\n", 14);
-    }
+    if (errno == ENOTEMPTY || errno == EEXIST)      (void)write(1, "The directory is not empty.\n", 28);
+    else if (errno == ENOENT)                       (void)write(1, "The system cannot find the file specified.\n", 44);
+    else                                            (void)write(1, "Access denied\n", 14);
 }
 
 static void builtin_copy(const char *arg) {
@@ -666,18 +925,12 @@ static void builtin_copy(const char *arg) {
             "COPY src1+src2 dest\n"
             "  Copies file(s).\n"
             "  Wildcards supported in src: * and ?\n"
-            "Examples:\n"
-            "  COPY A.TXT B.TXT\n"
-            "  COPY *.TXT \\DEST\n"
-            "  COPY \\BIN\\*.EXE \\BACKUP\n";
-        write(1, msg, strlen(msg));
+            "  Use: COPY CON file   (create file from keyboard)\n";
+        (void)write(1, msg, strlen(msg));
         return;
     }
 
-    if (!arg || !*arg) {
-        write(1, "File not found\n", 15);
-        return;
-    }
+    if (!arg || !*arg) { (void)write(1, "File not found\n", 15); return; }
 
     char tmp[1024];
     strncpy(tmp, arg, sizeof tmp - 1);
@@ -685,7 +938,7 @@ static void builtin_copy(const char *arg) {
 
     char *p = tmp;
     while (*p == ' ' || *p == '\t') p++;
-    if (!*p) { write(1, "File not found\n", 15); return; }
+    if (!*p) { (void)write(1, "File not found\n", 15); return; }
 
     // src token
     char *src = p;
@@ -697,18 +950,15 @@ static void builtin_copy(const char *arg) {
 
     // Concat mode: SRC1+SRC2 DEST (no wildcards here)
     if (strchr(src, '+')) {
-        if (!dst || !*dst) {
-            write(1, "Invalid number of parameters\n", 29);
-            return;
-        }
-        if (has_wildcards(src) || has_wildcards(dst)) {
-            write(1, "Invalid number of parameters\n", 29);
+        if (!dst || !*dst) { (void)write(1, "Invalid number of parameters\n", 29); return; }
+        if (has_wildcards(src) || (dst && has_wildcards(dst))) {
+            (void)write(1, "Invalid number of parameters\n", 29);
             return;
         }
 
         char dst_linux[PATH_MAX];
         if (dos_to_linux_path(dst, dst_linux, sizeof dst_linux) != 0) {
-            write(1, "Invalid drive\n", 14);
+            (void)write(1, "Invalid drive\n", 14);
             return;
         }
 
@@ -720,18 +970,18 @@ static void builtin_copy(const char *arg) {
 
             char src_linux[PATH_MAX];
             if (dos_to_linux_path(src, src_linux, sizeof src_linux) != 0) {
-                write(1, "File not found\n", 15);
+                (void)write(1, "File not found\n", 15);
                 return;
             }
 
             int in = open(src_linux, O_RDONLY);
-            if (in < 0) { write(1, "File not found\n", 15); return; }
+            if (in < 0) { (void)write(1, "File not found\n", 15); return; }
 
             int out_flags = O_WRONLY | O_CREAT;
             out_flags |= (files_copied == 0) ? O_TRUNC : O_APPEND;
 
             int out = open(dst_linux, out_flags, 0644);
-            if (out < 0) { close(in); write(1, "Access denied\n", 14); return; }
+            if (out < 0) { close(in); (void)write(1, "Access denied\n", 14); return; }
 
             char buf[4096];
             ssize_t n;
@@ -739,14 +989,14 @@ static void builtin_copy(const char *arg) {
                 ssize_t off = 0;
                 while (off < n) {
                     ssize_t w = write(out, buf + off, (size_t)(n - off));
-                    if (w < 0) { close(in); close(out); write(1, "Access denied\n", 14); return; }
+                    if (w < 0) { close(in); close(out); (void)write(1, "Access denied\n", 14); return; }
                     off += w;
                 }
             }
 
             close(in);
             close(out);
-            if (n < 0) { write(1, "Access denied\n", 14); return; }
+            if (n < 0) { (void)write(1, "Access denied\n", 14); return; }
 
             files_copied++;
 
@@ -758,24 +1008,23 @@ static void builtin_copy(const char *arg) {
 
         char msg[64];
         snprintf(msg, sizeof msg, "        %d file(s) copied.\n", files_copied);
-        write(1, msg, strlen(msg));
+        (void)write(1, msg, strlen(msg));
         return;
     }
 
     // Normal mode (supports wildcards in src)
     char src_linuxspec[PATH_MAX];
     if (dos_to_linux_path(src, src_linuxspec, sizeof src_linuxspec) != 0) {
-        write(1, "File not found\n", 15);
+        (void)write(1, "File not found\n", 15);
         return;
     }
 
-    // Destination linux path (if provided)
     char dst_linux[PATH_MAX];
     int have_dst = (dst && *dst);
 
     if (have_dst) {
         if (dos_to_linux_path(dst, dst_linux, sizeof dst_linux) != 0) {
-            write(1, "Invalid drive\n", 14);
+            (void)write(1, "Invalid drive\n", 14);
             return;
         }
     }
@@ -783,8 +1032,7 @@ static void builtin_copy(const char *arg) {
     // Wildcard source
     if (has_wildcards(src_linuxspec)) {
         if (!have_dst) {
-            // DOS requires a destination when multiple sources are possible
-            write(1, "Invalid number of parameters\n", 29);
+            (void)write(1, "Invalid number of parameters\n", 29);
             return;
         }
 
@@ -793,10 +1041,9 @@ static void builtin_copy(const char *arg) {
         split_dir_pat(src_linuxspec, dirpath, sizeof dirpath, pattern, sizeof pattern);
 
         DIR *d = opendir(dirpath);
-        if (!d) { write(1, "File not found\n", 15); return; }
+        if (!d) { (void)write(1, "File not found\n", 15); return; }
 
         int dst_is_dir = is_dir_path(dst_linux);
-
         int files_copied = 0;
 
         struct dirent *de;
@@ -809,28 +1056,26 @@ static void builtin_copy(const char *arg) {
 
             struct stat st;
             if (stat(fullsrc, &st) != 0) continue;
-            if (!S_ISREG(st.st_mode)) continue; // DOS COPY copies files
+            if (!S_ISREG(st.st_mode)) continue;
 
             char fulldst[PATH_MAX * 2];
 
             if (dst_is_dir) {
                 snprintf(fulldst, sizeof fulldst, "%s/%s", dst_linux, name);
             } else {
-                // If more than one match and dest is not a directory -> error like DOS
                 if (files_copied >= 1) {
                     closedir(d);
-                    write(1, "Invalid number of parameters\n", 29);
+                    (void)write(1, "Invalid number of parameters\n", 29);
                     return;
                 }
                 snprintf(fulldst, sizeof fulldst, "%s", dst_linux);
             }
 
-            // Copy (overwrite)
             int in = open(fullsrc, O_RDONLY);
             if (in < 0) continue;
 
             int out = open(fulldst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (out < 0) { close(in); closedir(d); write(1, "Access denied\n", 14); return; }
+            if (out < 0) { close(in); closedir(d); (void)write(1, "Access denied\n", 14); return; }
 
             char buf[4096];
             ssize_t n;
@@ -838,38 +1083,35 @@ static void builtin_copy(const char *arg) {
                 ssize_t off = 0;
                 while (off < n) {
                     ssize_t w = write(out, buf + off, (size_t)(n - off));
-                    if (w < 0) { close(in); close(out); closedir(d); write(1, "Access denied\n", 14); return; }
+                    if (w < 0) { close(in); close(out); closedir(d); (void)write(1, "Access denied\n", 14); return; }
                     off += w;
                 }
             }
 
             close(in);
             close(out);
-            if (n < 0) { closedir(d); write(1, "Access denied\n", 14); return; }
+            if (n < 0) { closedir(d); (void)write(1, "Access denied\n", 14); return; }
 
             files_copied++;
         }
 
         closedir(d);
 
-        if (files_copied == 0) {
-            write(1, "File not found\n", 15);
-            return;
-        }
+        if (files_copied == 0) { (void)write(1, "File not found\n", 15); return; }
 
         char msg[64];
         snprintf(msg, sizeof msg, "        %d file(s) copied.\n", files_copied);
-        write(1, msg, strlen(msg));
+        (void)write(1, msg, strlen(msg));
         return;
     }
 
     // Single-file copy (no wildcard)
-    // If no dest, copy into current dir with same basename
     char final_dst[PATH_MAX * 2];
+
     if (!have_dst) {
         const char *base = dos_basename(src);
         char cwd[PATH_MAX];
-        if (!getcwd(cwd, sizeof cwd)) { write(1, "Access denied\n", 14); return; }
+        if (!getcwd(cwd, sizeof cwd)) { (void)write(1, "Access denied\n", 14); return; }
         snprintf(final_dst, sizeof final_dst, "%s/%s", cwd, base);
     } else if (is_dir_path(dst_linux)) {
         const char *base = dos_basename(src);
@@ -879,10 +1121,10 @@ static void builtin_copy(const char *arg) {
     }
 
     int in = open(src_linuxspec, O_RDONLY);
-    if (in < 0) { write(1, "File not found\n", 15); return; }
+    if (in < 0) { (void)write(1, "File not found\n", 15); return; }
 
     int out = open(final_dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out < 0) { close(in); write(1, "Access denied\n", 14); return; }
+    if (out < 0) { close(in); (void)write(1, "Access denied\n", 14); return; }
 
     char buf[4096];
     ssize_t n;
@@ -890,99 +1132,16 @@ static void builtin_copy(const char *arg) {
         ssize_t off = 0;
         while (off < n) {
             ssize_t w = write(out, buf + off, (size_t)(n - off));
-            if (w < 0) { close(in); close(out); write(1, "Access denied\n", 14); return; }
+            if (w < 0) { close(in); close(out); (void)write(1, "Access denied\n", 14); return; }
             off += w;
         }
     }
 
     close(in);
     close(out);
-    if (n < 0) { write(1, "Access denied\n", 14); return; }
+    if (n < 0) { (void)write(1, "Access denied\n", 14); return; }
 
-    write(1, "        1 file(s) copied.\n", 27);
-}
-
-static void builtin_copy_con(const char *dst_dos) {
-    if (!dst_dos || !*dst_dos) {
-        write(1, "Invalid number of parameters\n", 29);
-        return;
-    }
-
-    char dst_linux[PATH_MAX];
-    if (dos_to_linux_path(dst_dos, dst_linux, sizeof dst_linux) != 0) {
-        write(1, "Invalid drive\n", 14);
-        return;
-    }
-
-    int fd = open(dst_linux, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        write(1, "Access denied\n", 14);
-        return;
-    }
-
-    write(1, "Enter text. End with Ctrl+Z.\n", 30);
-
-    struct termios oldt, raw;
-    int has_tty = (tcgetattr(0, &oldt) == 0);
-    if (has_tty) {
-        raw = oldt;
-        raw.c_lflag &= ~(ICANON | ECHO | ISIG); // raw-ish: no line mode, no echo, no signals
-        raw.c_iflag &= ~(ICRNL);                // don't translate CR->NL
-        raw.c_oflag &= ~(ONLCR);                // don't translate NL->CRLF on output
-        raw.c_cc[VMIN] = 1;
-        raw.c_cc[VTIME] = 0;
-        (void)tcsetattr(0, TCSANOW, &raw);
-    }
-
-    char linebuf[512];
-    size_t len = 0;
-
-    for (;;) {
-        unsigned char c;
-        ssize_t n = read(0, &c, 1);
-        if (n <= 0) break;
-
-        // Ctrl+Z ends input (DOS)
-        if (c == 0x1A) {
-            if (len) (void)write(fd, linebuf, len);
-            break;
-        }
-
-        // Enter: accept CR or LF, echo newline, write CRLF to file
-        if (c == '\r' || c == '\n') {
-            // Echo as CRLF so it looks right
-            (void)write(1, "\r\n", 2);
-
-            if (len) (void)write(fd, linebuf, len);
-            (void)write(fd, "\r\n", 2);
-            len = 0;
-            continue;
-        }
-
-        // Backspace (BS=0x08) or DEL=0x7F
-        if (c == 0x08 || c == 0x7F) {
-            if (len > 0) {
-                len--;
-                // Erase last char on screen: backspace, space, backspace
-                (void)write(1, "\b \b", 3);
-            }
-            continue;
-        }
-
-        // Ignore other control chars except tab
-        if (c < 0x20 && c != '\t') continue;
-
-        // Store + echo
-        if (len + 1 < sizeof linebuf) {
-            linebuf[len++] = (char)c;
-            (void)write(1, &c, 1);
-        }
-    }
-
-    if (has_tty) (void)tcsetattr(0, TCSANOW, &oldt);
-
-    close(fd);
-    write(1, "\r\n        1 file(s) copied.\r\n", 30);
+    (void)write(1, "        1 file(s) copied.\n", 27);
 }
 
 /* --- main --- */
@@ -996,6 +1155,9 @@ int main(void) {
     mkdir(DOS_C_ROOT, 0755);
     (void)chdir(DOS_C_ROOT);
 
+    load_config();
+    apply_color();
+
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_sigchld;
@@ -1005,8 +1167,8 @@ int main(void) {
 
     char line[1024];
 
-    write(1, "\nDOS-modern init shell (stage 1)\n", 33);
-    write(1, "Type 'help' or 'poweroff'\n\n", 27);
+    (void)write(1, "\nDazLab 64-DOS 0.1\nDistributed under a MIT license\n", 52);
+    (void)write(1, "Type 'help' or 'poweroff'\n\n", 27);
 
     for (;;) {
         if (g_got_sigchld) reap_children_nonblock();
@@ -1024,29 +1186,47 @@ int main(void) {
         if (is_cmd(line, "help")) {
             const char *msg =
                 "Built-ins (use /? after a command for help):\n"
-                "  HELP\n"
-                "  VER\n"
-                "  CLS\n"
-                "  CD\n"
-                "  DIR\n"
-                "  TYPE\n"
-                "  DEL / ERASE\n"
-                "  COPY\n"
-                "  REN / RENAME\n"
-                "  MD / MKDIR\n"
-                "  RD / RMDIR\n"
+                "  HELP  VER  CLS  COLOR  ECHO  PAUSE  EXIT\n"
+                "  CD    DIR  TYPE\n"
+                "  DEL/ERASE   REN/RENAME\n"
+                "  MD/MKDIR    RD/RMDIR\n"
+                "  COPY (also: COPY CON file)\n"
                 "  POWEROFF\n";
-            write(1, msg, strlen(msg));
+            (void)write(1, msg, strlen(msg));
             continue;
         }
 
         if (is_cmd(line, "ver")) {
-            write(1, "DOS-modern 0.0.1\n", 17);
+            (void)write(1, "DOS-modern 0.0.1\n", 17);
             continue;
         }
 
         if (is_cmd(line, "cls")) {
             builtin_cls();
+            continue;
+        }
+
+        if (is_cmd(line, "color")) {
+            char *arg = line + 5;
+            while (*arg == ' ' || *arg == '\t') arg++;
+            builtin_color(*arg ? arg : 0);
+            continue;
+        }
+
+        if (is_cmd(line, "echo")) {
+            char *arg = line + 4;
+            while (*arg == ' ' || *arg == '\t') arg++;
+            builtin_echo(*arg ? arg : 0);
+            continue;
+        }
+
+        if (is_cmd(line, "pause")) {
+            builtin_pause();
+            continue;
+        }
+
+        if (is_cmd(line, "exit")) {
+            builtin_exit();
             continue;
         }
 
@@ -1083,26 +1263,6 @@ int main(void) {
             continue;
         }
 
-        if (is_cmd(line, "copy")) {
-          char *arg = line + 4;
-          while (*arg == ' ' || *arg == '\t') arg++;
-
-         // COPY CON filename
-          if (arg[0] && (tolower((unsigned char)arg[0]) == 'c') &&
-            (tolower((unsigned char)arg[1]) == 'o') &&
-            (tolower((unsigned char)arg[2]) == 'n') &&
-            (arg[3] == 0 || arg[3] == ' ' || arg[3] == '\t')) {
-
-            char *dst = arg + 3;
-            while (*dst == ' ' || *dst == '\t') dst++;
-            builtin_copy_con(*dst ? dst : 0);
-            continue;
-        }
-
-        builtin_copy(*arg ? arg : 0);
-        continue;
-      }
-
         if (is_cmd(line, "ren") || is_cmd(line, "rename")) {
             char *arg = line + (tolower((unsigned char)line[0]) == 'r' && tolower((unsigned char)line[1]) == 'e' ? 3 : 6);
             while (*arg == ' ' || *arg == '\t') arg++;
@@ -1124,7 +1284,28 @@ int main(void) {
             continue;
         }
 
-        write(1, "Bad command or file name\n", 25);
+        if (is_cmd(line, "copy")) {
+            char *arg = line + 4;
+            while (*arg == ' ' || *arg == '\t') arg++;
+
+            // COPY CON filename
+            if (arg[0] &&
+                tolower((unsigned char)arg[0]) == 'c' &&
+                tolower((unsigned char)arg[1]) == 'o' &&
+                tolower((unsigned char)arg[2]) == 'n' &&
+                (arg[3] == 0 || arg[3] == ' ' || arg[3] == '\t')) {
+
+                char *dst = arg + 3;
+                while (*dst == ' ' || *dst == '\t') dst++;
+                builtin_copy_con(*dst ? dst : 0);
+                continue;
+            }
+
+            builtin_copy(*arg ? arg : 0);
+            continue;
+        }
+
+        (void)write(1, "Bad command or file name\n", 25);
     }
 }
 
