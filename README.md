@@ -11,6 +11,8 @@ not a user experience.
 
 ---
 
+![](images/cmd.png)
+
 ## What this is
 
 - 64-bit Linux kernel
