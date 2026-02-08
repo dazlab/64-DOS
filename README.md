@@ -41,7 +41,7 @@ Given the inherent incompatibilities in implementing a true Real-Mode DOS on mod
 in building a modern DOS from the ground up (as much as I would love such a project to exist), the simplest solution I could think 
 of was to utilise the Linux kernel and build on top of it a custom DOS-like command shell.
 
-**This is a conceptual experiment. I don't really know what utility it has, or where one could go with the idea.***
+**This is a conceptual experiment. I don't really know what utility it has, or how far one could go with the idea.**
 
 ### Current Features
 The system currently boots into the command shell and provides a suite of DOS builtins, written in C:
