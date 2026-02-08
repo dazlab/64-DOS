@@ -12,6 +12,9 @@ init/local.env
 *.vmdk
 *.qcow2
 init/.build/
+.build/
+com64/
+
 
 # Buildroot output
 buildroot/output/
