@@ -8,6 +8,8 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
@@ -428,7 +430,7 @@ static void builtin_echo(const char *arg) {
         g_echo_on = 1;
         return;
     }
-    if (!strncasecmp(arg, "off", 3) && (arg[3] == 0 || arg[3] == ' ' || arg[3] == '\t')) {
+    if (!strncasecmp(arg, "off", 3) && (arg[3] == 0 || arg[3] == ' ' || arg[3] == ' ' || arg[3] == '\t')) {
         g_echo_on = 0;
         return;
     }
@@ -738,13 +740,9 @@ static void builtin_dir(const char *arg) {
     if (!filespec) {
         linux_to_dos_cwd(doshdr, sizeof doshdr);
     } else {
-        // If they passed a directory, show that dir. If they passed a filespec, show the spec token.
         if (filespec[0] == '\\' || filespec[0] == '/') snprintf(doshdr, sizeof doshdr, "C:%s", filespec);
         else if (isalpha((unsigned char)filespec[0]) && filespec[1] == ':') snprintf(doshdr, sizeof doshdr, "%s", filespec);
-        else {
-            // relative token: show current dir (DOS does)
-            linux_to_dos_cwd(doshdr, sizeof doshdr);
-        }
+        else linux_to_dos_cwd(doshdr, sizeof doshdr);
         for (size_t i = 0; doshdr[i]; i++) if (doshdr[i] == '/') doshdr[i] = '\\';
     }
 
@@ -1144,6 +1142,196 @@ static void builtin_copy(const char *arg) {
     (void)write(1, "        1 file(s) copied.\n", 27);
 }
 
+/* ============================================================
+   COM64 LOADER (runs in a child process so PID 1 never dies)
+   ============================================================ */
+
+typedef struct DosApi {
+    void (*print)(const char* s);
+} DosApi;
+
+typedef struct Com64Hdr {
+    char     magic[8];      // "64DOSCOM"
+    uint32_t header_size;   // 64
+    uint32_t flags;         // 0
+    uint64_t entry_rva;     // from payload start (immediately after header)
+    uint64_t bss_size;      // bytes to zero after payload
+    uint64_t reserved0;
+    uint64_t reserved1;
+    uint64_t reserved2;
+} Com64Hdr;
+
+typedef int (*Com64Entry)(DosApi* api, int argc, const char** argv);
+
+static void dosapi_print_impl(const char* s) {
+    if (!s) return;
+    (void)write(1, s, strlen(s));
+}
+
+static int read_all(int fd, void* buf, size_t n) {
+    uint8_t* p = (uint8_t*)buf;
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, p + got, n - got);
+        if (r == 0) return -1;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        got += (size_t)r;
+    }
+    return 0;
+}
+
+static int run_com64_hostpath(const char* host_path, int argc, const char** argv) {
+    int fd = open(host_path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return -1; }
+    if (st.st_size < (off_t)sizeof(Com64Hdr)) { close(fd); return -1; }
+
+    Com64Hdr hdr;
+    if (read_all(fd, &hdr, sizeof(hdr)) != 0) { close(fd); return -1; }
+
+    if (memcmp(hdr.magic, "64DOSCOM", 8) != 0) { close(fd); return -1; }
+    if (hdr.header_size != 64) { close(fd); return -1; }
+
+    size_t file_size = (size_t)st.st_size;
+    size_t payload_size = file_size - sizeof(Com64Hdr);
+    if (hdr.entry_rva >= payload_size) { close(fd); return -1; }
+
+    size_t image_size = payload_size + (size_t)hdr.bss_size;
+
+    void* image = mmap(NULL, image_size,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (image == MAP_FAILED) { close(fd); return -1; }
+
+    // fd is already positioned just after header
+    if (read_all(fd, image, payload_size) != 0) {
+        munmap(image, image_size);
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (hdr.bss_size) {
+        memset((uint8_t*)image + payload_size, 0, (size_t)hdr.bss_size);
+    }
+
+    DosApi api;
+    api.print = dosapi_print_impl;
+
+    uint8_t* payload_base = (uint8_t*)image;
+    Com64Entry entry = (Com64Entry)(payload_base + hdr.entry_rva);
+
+    int rc = entry(&api, argc, argv);
+
+    munmap(image, image_size);
+    return rc;
+}
+
+/* Run COM64 in a child so init (PID 1) never dies if it crashes. */
+static int run_com64_sandboxed(const char* host_path, int argc, const char** argv) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        (void)write(1, "Insufficient memory\n", 20);
+        return 1; // we handled the command attempt
+    }
+
+    if (pid == 0) {
+        int rc = run_com64_hostpath(host_path, argc, argv);
+        if (rc < 0) _exit(127);
+        _exit(rc & 0xFF);
+    }
+
+    int st = 0;
+    for (;;) {
+        if (waitpid(pid, &st, 0) >= 0) break;
+        if (errno == EINTR) continue;
+        break;
+    }
+
+    if (WIFSIGNALED(st)) {
+        (void)write(1, "Program terminated\n", 19);
+    }
+
+    return 1;
+}
+
+static int file_exists_regular(const char* path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return S_ISREG(st.st_mode);
+}
+
+/* returns 1 if it ran something, 0 if not found/not runnable */
+static int try_run_external_com64(const char* line) {
+    // Extract first token (command)
+    char cmd[PATH_MAX];
+    size_t i = 0;
+    const char* p = line;
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) return 0;
+
+    while (*p && *p != ' ' && *p != '\t' && i + 1 < sizeof(cmd)) {
+        cmd[i++] = *p++;
+    }
+    cmd[i] = 0;
+
+    // Minimal argv (argv parsing later)
+    const char* argv[2];
+    argv[0] = cmd;
+    argv[1] = NULL;
+    int argc = 1;
+
+    int has_path = (strchr(cmd, '\\') || strchr(cmd, '/') ||
+                    (isalpha((unsigned char)cmd[0]) && cmd[1] == ':'));
+    int has_ext = (strchr(cmd, '.') != NULL);
+
+    char host_path[PATH_MAX];
+    char host_try[PATH_MAX];
+
+    if (has_path) {
+        // cmd includes a path/drive
+        if (dos_to_linux_path(cmd, host_path, sizeof(host_path)) != 0) return 0;
+
+        if (file_exists_regular(host_path)) {
+            return run_com64_sandboxed(host_path, argc, argv);
+        }
+
+        if (!has_ext) {
+            // Try adding .COM64
+            if (snprintf(host_try, sizeof(host_try), "%s.COM64", host_path) > 0) {
+                if (file_exists_regular(host_try)) {
+                    return run_com64_sandboxed(host_try, argc, argv);
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    // No path: look in current directory only (PATH later)
+    // Try cmd as typed
+    if (file_exists_regular(cmd)) {
+        return run_com64_sandboxed(cmd, argc, argv);
+    }
+
+    // Try cmd.COM64 if no extension was provided
+    if (!has_ext) {
+        if (snprintf(host_try, sizeof(host_try), "%s.COM64", cmd) > 0) {
+            if (file_exists_regular(host_try)) {
+                return run_com64_sandboxed(host_try, argc, argv);
+            }
+        }
+    }
+
+    return 0;
+}
+
 /* --- main --- */
 
 int main(void) {
@@ -1302,6 +1490,10 @@ int main(void) {
             }
 
             builtin_copy(*arg ? arg : 0);
+            continue;
+        }
+
+        if (try_run_external_com64(line)) {
             continue;
         }
 
